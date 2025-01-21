@@ -76,7 +76,7 @@ func Init(config AuthConfig) (*auth, error) {
 		var err error
 		a.db, err = sql.Open("sqlite3", config.DatabaseSourceName)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to connect to database: %v", err)
+			return nil, fmt.Errorf("failed to connect to database: %v", err)
 		}
 	} else {
 		a.db = config.DB
@@ -175,7 +175,7 @@ func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string
 
 }
 
-func GetRefreshtokenFromCookie(r *http.Request) (string, error) {
+func GetRefreshTokenFromRequest(r *http.Request) (string, error) {
 	cookie, err := r.Cookie("refresh_token")
 	if err != nil {
 		return "", fmt.Errorf("could not get refresh token from cookie: %v", err)
@@ -215,8 +215,10 @@ func (a *auth) Refresh(refreshToken string) (accessToken string, err error) {
 
 	// Check if refresh token exists in database
 	var exists bool
-	err = a.db.QueryRow("SELECT EXISTS (SELECT 1 FROM refresh_tokens WHERE user_id = ? AND token = ?)",
-		claims.UserID, refreshToken).Scan(&exists)
+	err = a.db.QueryRow(
+		"SELECT EXISTS (SELECT 1 FROM refresh_tokens WHERE user_id = ? AND token = ?)",
+		claims.UserID, refreshToken,
+	).Scan(&exists)
 	if err != nil || !exists {
 		return "", fmt.Errorf("Refresh token not valid %w", err)
 	}
