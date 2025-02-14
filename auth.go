@@ -60,13 +60,14 @@ type AuthConfig struct {
 }
 
 type user struct {
+	id       int
 	UserID   string `json:"uuid"`
 	Password string `json:"password"`
 }
 
 type Claims struct {
-	UserID string `json:"user_id"`
-	jwt.Claims
+	UserID int `json:"user_id"`
+	jwt.RegisteredClaims
 }
 
 func (a *auth) Close() error {
@@ -118,11 +119,10 @@ func Init(config AuthConfig) (*auth, error) {
 
 	_, err := a.db.Exec(`
 CREATE TABLE IF NOT EXISTS users (
-	id INTEGER PRIMARY KEY AUTOINCREMENT
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	user_id TEXT NOT NULL,
 	password TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS refresh_tokens (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	user_id INTEGER NOT NULL,
@@ -137,26 +137,44 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 	return &a, nil
 }
 
-func (a *auth) Register(userID, password string) error {
+func (a *auth) Register(userID, password string) (*user, error) {
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return newErr(internalErr, fmt.Errorf("failed to hash password: %w", err))
+		return nil, newErr(internalErr, fmt.Errorf("failed to hash password: %w", err))
 	}
 
 	// Save user to database
-	_, err = a.db.Exec("INSERT INTO users (user_id, password) VALUES (?, ?)", userID, string(hashedPassword))
+	res, err := a.db.Exec("INSERT INTO users (user_id, password) VALUES (?, ?)", userID, string(hashedPassword))
 	if err != nil {
-		return newErr(internalErr, fmt.Errorf("DB error orUser already exists %w", err))
+		return nil, newErr(internalErr, fmt.Errorf("DB error orUser already exists %w", err))
 	}
 
-	return nil
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+
+	var user user
+	user.id = int(id)
+	user.UserID = userID
+	user.Password = password
+
+	return &user, nil
 }
 
-func (a *auth) Login(userID, password string, w http.ResponseWriter) (accessToken string, refreshToken string, err error) {
-	// Fetch user from database
+func (a *auth) getUserDetails(userID string) (*user, error) {
 	var storedUser user
-	err = a.db.QueryRow("SELECT userID, password FROM users WHERE userID = ?", userID).Scan(&storedUser.UserID, &storedUser.Password)
+	err := a.db.QueryRow("SELECT id, user_id, password FROM users WHERE user_id = ?", userID).Scan(&storedUser.UserID, &storedUser.UserID, &storedUser.Password)
+	if err != nil {
+		return nil, err
+	}
+	return &storedUser, nil
+}
+
+func (a *auth) Login(userID, password string) (accessToken string, refreshToken string, err error) {
+	// Fetch user from database
+	storedUser, err := a.getUserDetails(userID)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("error fetching stored user from db %w", err))
 	}
@@ -167,24 +185,37 @@ func (a *auth) Login(userID, password string, w http.ResponseWriter) (accessToke
 	}
 
 	// Generate JWT tokens
-	accessToken, err = a.generateToken(storedUser.UserID, a.accessTokenDuration)
+	accessToken, err = a.generateToken(storedUser.id, a.accessTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to create access token %w", err))
 	}
 
-	refreshToken, err = a.generateToken(storedUser.UserID, a.refreshTokenDuration)
+	refreshToken, err = a.generateToken(storedUser.id, a.refreshTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to create refresh token %w", err))
 	}
 
-	if err := a.saveRefreshToken(storedUser.UserID, refreshToken); err != nil {
+	if err := a.saveRefreshToken(storedUser.id, refreshToken); err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to save refresh token during login"))
 	}
 
 	return accessToken, refreshToken, nil
 }
 
-func (a *auth) saveRefreshToken(userID string, refreshToken string) error {
+func (a *auth) Logout(userID string) error {
+
+	user, err := a.getUserDetails(userID)
+	if err != nil {
+		return err
+	}
+
+	if _, err := a.db.Exec(`DELETE FROM refresh_tokens WHERE user_id = ?`, user.id); err != nil {
+		return newErr(internalErr, fmt.Errorf(`failed to delete from refresh tokens at logout: %w`, err))
+	}
+	return nil
+}
+
+func (a *auth) saveRefreshToken(userID int, refreshToken string) error {
 	// Save refresh token to database
 	_, err := a.db.Exec("INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
 		userID, refreshToken, time.Now().Add(a.refreshTokenDuration))
@@ -194,9 +225,8 @@ func (a *auth) saveRefreshToken(userID string, refreshToken string) error {
 	return nil
 }
 
-func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string) {
-
-	// Set secure cookies
+func (a *auth) SetAccessToken(w http.ResponseWriter, accessToken string) {
+	// Set new access token in secure cookie
 	http.SetCookie(w, &http.Cookie{
 		Name:     "access_token",
 		Value:    accessToken,
@@ -205,6 +235,9 @@ func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string
 		HttpOnly: true,
 		Secure:   true,
 	})
+}
+
+func (a *auth) SetRefreshToken(w http.ResponseWriter, refreshToken string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "refresh_token",
 		Value:    refreshToken,
@@ -213,7 +246,12 @@ func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string
 		HttpOnly: true,
 		Secure:   true,
 	})
+}
 
+func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string) {
+	// Set secure cookies
+	a.SetAccessToken(w, accessToken)
+	a.SetRefreshToken(w, refreshToken)
 }
 
 func GetRefreshTokenFromRequest(r *http.Request) (string, error) {
@@ -286,22 +324,10 @@ func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshTo
 
 }
 
-func (a *auth) SetAccessToken(w http.ResponseWriter, accessToken string) {
-	// Set new access token in secure cookie
-	http.SetCookie(w, &http.Cookie{
-		Name:     "access_token",
-		Value:    accessToken,
-		Path:     "/",
-		Expires:  time.Now().Add(a.accessTokenDuration),
-		HttpOnly: true,
-		Secure:   true,
-	})
-}
-
-func (a *auth) generateToken(userID string, expiry time.Duration) (string, error) {
+func (a *auth) generateToken(userID int, expiry time.Duration) (string, error) {
 	claims := &Claims{
-		UserID: userID,
-		Claims: jwt.RegisteredClaims{
+		userID,
+		jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
 		},
 	}
