@@ -271,19 +271,17 @@ takes cookie.Value
 		return
 	}
 
-refreshToken, err := GetRefreshtokenFromCookie(r)
-
+	refreshToken, err := GetRefreshtokenFromCookie(r)
 	if err != nil {
 		// ...
 	}
 
-accessToken, err := Refresh(refreshToken)
-
+	accessToken, err := Refresh(refreshToken)
 	if err != nil {
 		// ...
 	}
 
-SetAccessToken(w, accessToken)
+	SetAccessToken(w, accessToken)
 */
 func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshToken string, err error) {
 	// Validate refresh token
