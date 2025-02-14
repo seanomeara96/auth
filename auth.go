@@ -7,39 +7,73 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
 
+type authErrorType string
+
+const internalErr authErrorType = authErrorType("internal")
+const clientErr authErrorType = authErrorType("client")
+
+type authError struct {
+	t authErrorType
+	e error
+}
+
+func (ae authError) Error() string {
+	return fmt.Sprintf(`%s error occured in auth lib: %v`, ae.t, ae.e)
+}
+
+var errAuthDefault = errors.New("an error occurred in auth lib")
+
+func newErr(t authErrorType, msg interface{}) *authError {
+	err, ok := msg.(error)
+	if !ok {
+		str, ok := msg.(string)
+		if !ok {
+			err = errAuthDefault
+		} else {
+			err = errors.New(str)
+		}
+	}
+	return &authError{
+		t: t,
+		e: err,
+	}
+}
+
 type auth struct {
-	db                 *sql.DB
-	jwtSecretKey       []byte
-	accessTokenExpiry  time.Duration
-	refreshTokenExpiry time.Duration
+	db                   *sql.DB
+	jwtSecretKey         []byte
+	accessTokenDuration  time.Duration
+	refreshTokenDuration time.Duration
 }
 
 type AuthConfig struct {
-	DB                 *sql.DB
-	JWTSecretKey       string
-	AccessTokenExpiry  time.Duration
-	RefreshTokenExpiry time.Duration
-	DatabaseSourceName string
+	DB                   *sql.DB
+	JWTSecretKey         string
+	AccessTokenDuration  time.Duration
+	RefreshTokenDuration time.Duration
+	DatabaseSourceName   string
 }
 
 type user struct {
-	ID       int    `json:"id"`
 	UserID   string `json:"uuid"`
 	Password string `json:"password"`
 }
 
 type Claims struct {
-	UserID int `json:"user_id"`
-	jwt.StandardClaims
+	UserID string `json:"user_id"`
+	jwt.Claims
 }
 
-func (a *auth) Close() {
-	a.db.Close()
+func (a *auth) Close() error {
+	if a.db != nil {
+		return a.db.Close()
+	}
+	return nil
 }
 
 func Init(config AuthConfig) (*auth, error) {
@@ -57,26 +91,26 @@ func Init(config AuthConfig) (*auth, error) {
 	)*/
 
 	if config.JWTSecretKey == "" {
-		return nil, errors.New("must supply a jwt secret key")
+		return nil, newErr(internalErr, "must supply a jwt secret key")
 	}
 	a.jwtSecretKey = []byte(config.JWTSecretKey)
 
-	if config.AccessTokenExpiry < (time.Minute * 15) {
-		config.AccessTokenExpiry = time.Minute * 15
+	if config.AccessTokenDuration < (time.Minute * 15) {
+		config.AccessTokenDuration = time.Minute * 15
 	}
-	a.accessTokenExpiry = config.AccessTokenExpiry
+	a.accessTokenDuration = config.AccessTokenDuration
 
-	if config.RefreshTokenExpiry < (time.Hour * 24 * 7) {
-		config.RefreshTokenExpiry = time.Hour * 24 * 7
+	if config.RefreshTokenDuration < (time.Hour * 24 * 7) {
+		config.RefreshTokenDuration = time.Hour * 24 * 7
 	}
-	a.refreshTokenExpiry = config.RefreshTokenExpiry
+	a.refreshTokenDuration = config.RefreshTokenDuration
 
 	if config.DB == nil {
 		// Initialize SQLite database
 		var err error
 		a.db, err = sql.Open("sqlite3", config.DatabaseSourceName)
 		if err != nil {
-			return nil, fmt.Errorf("failed to connect to database: %v", err)
+			return nil, newErr(internalErr, fmt.Errorf("failed to connect to database: %w", err))
 		}
 	} else {
 		a.db = config.DB
@@ -97,7 +131,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 	FOREIGN KEY (user_id) REFERENCES users(id)
 );`)
 	if err != nil {
-		return &a, err
+		return &a, newErr(internalErr, fmt.Errorf("an error occured when trying to initalisee the tables: %w", err))
 	}
 
 	return &a, nil
@@ -107,13 +141,13 @@ func (a *auth) Register(userID, password string) error {
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return fmt.Errorf("failed to hash password: %w", err)
+		return newErr(internalErr, fmt.Errorf("failed to hash password: %w", err))
 	}
 
 	// Save user to database
 	_, err = a.db.Exec("INSERT INTO users (user_id, password) VALUES (?, ?)", userID, string(hashedPassword))
 	if err != nil {
-		return fmt.Errorf("DB error orUser already exists %w", err)
+		return newErr(internalErr, fmt.Errorf("DB error orUser already exists %w", err))
 	}
 
 	return nil
@@ -122,35 +156,42 @@ func (a *auth) Register(userID, password string) error {
 func (a *auth) Login(userID, password string, w http.ResponseWriter) (accessToken string, refreshToken string, err error) {
 	// Fetch user from database
 	var storedUser user
-	err = a.db.QueryRow("SELECT id, userID, password FROM users WHERE userID = ?", userID).Scan(&storedUser.ID, &storedUser.UserID, &storedUser.Password)
+	err = a.db.QueryRow("SELECT userID, password FROM users WHERE userID = ?", userID).Scan(&storedUser.UserID, &storedUser.Password)
 	if err != nil {
-		return "", "", fmt.Errorf("error fetching stored user from db %w", err)
+		return "", "", newErr(internalErr, fmt.Errorf("error fetching stored user from db %w", err))
 	}
 
 	// Check password
 	if err := bcrypt.CompareHashAndPassword([]byte(storedUser.Password), []byte(password)); err != nil {
-		return "", "", fmt.Errorf("invalid credentials %v", err)
+		return "", "", newErr(clientErr, fmt.Errorf("invalid credentials %w", err))
 	}
 
 	// Generate JWT tokens
-	accessToken, err = a.generateToken(storedUser.ID, a.accessTokenExpiry)
+	accessToken, err = a.generateToken(storedUser.UserID, a.accessTokenDuration)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create access token %v", err)
+		return "", "", newErr(internalErr, fmt.Errorf("failed to create access token %w", err))
 	}
 
-	refreshToken, err = a.generateToken(storedUser.ID, a.refreshTokenExpiry)
+	refreshToken, err = a.generateToken(storedUser.UserID, a.refreshTokenDuration)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create refresh token %v", err)
+		return "", "", newErr(internalErr, fmt.Errorf("failed to create refresh token %w", err))
 	}
 
-	// Save refresh token to database
-	_, err = a.db.Exec("INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
-		storedUser.ID, refreshToken, time.Now().Add(a.refreshTokenExpiry))
-	if err != nil {
-		return "", "", fmt.Errorf("failed to save refresh token %w", err)
+	if err := a.saveRefreshToken(storedUser.UserID, refreshToken); err != nil {
+		return "", "", newErr(internalErr, fmt.Errorf("failed to save refresh token during login"))
 	}
 
 	return accessToken, refreshToken, nil
+}
+
+func (a *auth) saveRefreshToken(userID string, refreshToken string) error {
+	// Save refresh token to database
+	_, err := a.db.Exec("INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
+		userID, refreshToken, time.Now().Add(a.refreshTokenDuration))
+	if err != nil {
+		return newErr(internalErr, fmt.Errorf("failed to save refresh token %w", err))
+	}
+	return nil
 }
 
 func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string) {
@@ -160,7 +201,7 @@ func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string
 		Name:     "access_token",
 		Value:    accessToken,
 		Path:     "/",
-		Expires:  time.Now().Add(a.accessTokenExpiry),
+		Expires:  time.Now().Add(a.accessTokenDuration),
 		HttpOnly: true,
 		Secure:   true,
 	})
@@ -168,7 +209,7 @@ func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string
 		Name:     "refresh_token",
 		Value:    refreshToken,
 		Path:     "/",
-		Expires:  time.Now().Add(a.refreshTokenExpiry),
+		Expires:  time.Now().Add(a.refreshTokenDuration),
 		HttpOnly: true,
 		Secure:   true,
 	})
@@ -178,7 +219,7 @@ func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string
 func GetRefreshTokenFromRequest(r *http.Request) (string, error) {
 	cookie, err := r.Cookie("refresh_token")
 	if err != nil {
-		return "", fmt.Errorf("could not get refresh token from cookie: %v", err)
+		return "", newErr(internalErr, fmt.Errorf("could not get refresh token from cookie: %w", err))
 	}
 
 	return cookie.Value, nil
@@ -206,11 +247,11 @@ accessToken, err := Refresh(refreshToken)
 
 SetAccessToken(w, accessToken)
 */
-func (a *auth) Refresh(refreshToken string) (accessToken string, err error) {
+func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshToken string, err error) {
 	// Validate refresh token
 	claims, err := a.validateToken(refreshToken)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// Check if refresh token exists in database
@@ -219,17 +260,29 @@ func (a *auth) Refresh(refreshToken string) (accessToken string, err error) {
 		"SELECT EXISTS (SELECT 1 FROM refresh_tokens WHERE user_id = ? AND token = ?)",
 		claims.UserID, refreshToken,
 	).Scan(&exists)
-	if err != nil || !exists {
-		return "", fmt.Errorf("Refresh token not valid %w", err)
+	if err != nil {
+		return "", "", newErr(internalErr, fmt.Errorf(`could not determine existence of refresh token. %w`, err))
+	}
+	if !exists {
+		return "", "", newErr(clientErr, "Refresh token not valid")
 	}
 
 	// Generate new access token
-	accessToken, err = a.generateToken(claims.UserID, a.accessTokenExpiry)
+	newAccessToken, err = a.generateToken(claims.UserID, a.accessTokenDuration)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate access token %w", err)
+		return "", "", newErr(internalErr, fmt.Errorf("failed to generate access token in refresh function %w", err))
 	}
 
-	return accessToken, nil
+	newRefreshToken, err = a.generateToken(claims.UserID, a.refreshTokenDuration)
+	if err != nil {
+		return "", "", newErr(internalErr, fmt.Errorf("failed to generate refresh token in refresh function %w", err))
+	}
+
+	if err := a.saveRefreshToken(claims.UserID, refreshToken); err != nil {
+		return "", "", newErr(internalErr, "failed to save new refresh token during refresh")
+	}
+
+	return newAccessToken, newRefreshToken, nil
 
 }
 
@@ -239,17 +292,17 @@ func (a *auth) SetAccessToken(w http.ResponseWriter, accessToken string) {
 		Name:     "access_token",
 		Value:    accessToken,
 		Path:     "/",
-		Expires:  time.Now().Add(a.accessTokenExpiry),
+		Expires:  time.Now().Add(a.accessTokenDuration),
 		HttpOnly: true,
 		Secure:   true,
 	})
 }
 
-func (a *auth) generateToken(userID int, expiry time.Duration) (string, error) {
+func (a *auth) generateToken(userID string, expiry time.Duration) (string, error) {
 	claims := &Claims{
 		UserID: userID,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: time.Now().Add(expiry).Unix(),
+		Claims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
 		},
 	}
 
@@ -261,10 +314,13 @@ func (a *auth) validateToken(tokenString string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
 		return a.jwtSecretKey, nil
 	})
+	if err != nil {
+		return nil, newErr(internalErr, fmt.Errorf(`failed to parse with claims while validating token: %w`, err))
+	}
 
 	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
 		return claims, nil
 	}
 
-	return nil, err
+	return nil, newErr(clientErr, `invalid access token cannot be validated`)
 }
