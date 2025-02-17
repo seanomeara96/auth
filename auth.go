@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -120,18 +121,20 @@ func Init(config AuthConfig) (*auth, error) {
 	_, err := a.db.Exec(`
 CREATE TABLE IF NOT EXISTS users (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	user_id TEXT NOT NULL,
+	user_id TEXT NOT NULL UNIQUE,
 	password TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS refresh_tokens (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	user_id INTEGER NOT NULL,
-	token TEXT NOT NULL,
+	token TEXT NOT NULL UNIQUE,
 	expires_at DATETIME NOT NULL,
 	FOREIGN KEY (user_id) REFERENCES users(id)
-);`)
+);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
+`)
 	if err != nil {
-		return &a, newErr(internalErr, fmt.Errorf("an error occured when trying to initalisee the tables: %w", err))
+		return &a, newErr(internalErr, fmt.Errorf("an error occured when trying to initalise the tables: %w", err))
 	}
 
 	return &a, nil
@@ -234,6 +237,7 @@ func (a *auth) SetAccessToken(w http.ResponseWriter, accessToken string) {
 		Expires:  time.Now().Add(a.accessTokenDuration),
 		HttpOnly: true,
 		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
 	})
 }
 
@@ -245,6 +249,7 @@ func (a *auth) SetRefreshToken(w http.ResponseWriter, refreshToken string) {
 		Expires:  time.Now().Add(a.refreshTokenDuration),
 		HttpOnly: true,
 		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
 	})
 }
 
@@ -314,8 +319,8 @@ func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshTo
 		return "", "", newErr(internalErr, fmt.Errorf("failed to generate refresh token in refresh function %w", err))
 	}
 
-	if err := a.saveRefreshToken(claims.UserID, refreshToken); err != nil {
-		return "", "", newErr(internalErr, "failed to save new refresh token during refresh")
+	if err := a.saveRefreshToken(claims.UserID, newRefreshToken); err != nil {
+		return "", "", newErr(internalErr, fmt.Errorf("failed to save new refresh token during refresh: %w", err))
 	}
 
 	return newAccessToken, newRefreshToken, nil
@@ -323,10 +328,14 @@ func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshTo
 }
 
 func (a *auth) generateToken(userID int, expiry time.Duration) (string, error) {
+	// Generate a random UUID
+	randomID := uuid.New().String()
+
 	claims := &Claims{
-		userID,
-		jwt.RegisteredClaims{
+		UserID: userID,
+		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
+			ID:        randomID, // Add the random UUID as the JWT ID
 		},
 	}
 
