@@ -131,6 +131,11 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 	expires_at DATETIME NOT NULL,
 	FOREIGN KEY (user_id) REFERENCES users(id)
 );
+CREATE TABLE IF NOT EXISTS blacklisted_tokens(
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	token TEXT NOT NULL UNIQUE,
+	blacklisted_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
 `)
 	if err != nil {
@@ -138,6 +143,17 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)
 	}
 
 	return &a, nil
+}
+
+func (a *auth) blacklistToken(tokenString string) error {
+	_, err := a.db.Exec(`INSERT INTO blacklisted_tokens(token)VALUES(?)`, tokenString)
+	return err
+}
+
+func (a *auth) IsTokenBlacklisted(tokenString string) (bool, error) {
+	var exists bool = false
+	err := a.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM blacklisted_tokens WHERE token = ?)`, tokenString).Scan(&exists)
+	return exists, err
 }
 
 func (a *auth) Register(userID, password string) (*user, error) {
@@ -205,16 +221,16 @@ func (a *auth) Login(userID, password string) (accessToken string, refreshToken 
 	return accessToken, refreshToken, nil
 }
 
-func (a *auth) Logout(userID string) error {
+func (a *auth) Logout(refreshToken string) error {
 
-	user, err := a.getUserDetails(userID)
-	if err != nil {
+	if _, err := a.db.Exec(`DELETE FROM refresh_tokens WHERE token = ?`, refreshToken); err != nil {
+		return newErr(internalErr, fmt.Errorf(`failed to delete from refresh tokens at logout: %w`, err))
+	}
+
+	if err := a.blacklistToken(refreshToken); err != nil {
 		return err
 	}
 
-	if _, err := a.db.Exec(`DELETE FROM refresh_tokens WHERE user_id = ?`, user.id); err != nil {
-		return newErr(internalErr, fmt.Errorf(`failed to delete from refresh tokens at logout: %w`, err))
-	}
 	return nil
 }
 
@@ -259,10 +275,31 @@ func (a *auth) SetTokens(w http.ResponseWriter, accessToken, refreshToken string
 	a.SetRefreshToken(w, refreshToken)
 }
 
-func GetRefreshTokenFromRequest(r *http.Request) (string, error) {
+func (a *auth) GetTokensFromRequest(r *http.Request) (accessToken string, refreshToken string, err error) {
+	accessToken, err = a.GetAccessTokenFromRequest(r)
+	if err != nil {
+		return "", "", err
+	}
+	refreshToken, err = a.GetRefreshTokenFromRequest(r)
+	if err != nil {
+		return "", "", err
+	}
+	return accessToken, refreshToken, err
+}
+
+func (a *auth) GetRefreshTokenFromRequest(r *http.Request) (string, error) {
 	cookie, err := r.Cookie("refresh_token")
 	if err != nil {
 		return "", newErr(internalErr, fmt.Errorf("could not get refresh token from cookie: %w", err))
+	}
+
+	return cookie.Value, nil
+}
+
+func (a *auth) GetAccessTokenFromRequest(r *http.Request) (string, error) {
+	cookie, err := r.Cookie("access_token")
+	if err != nil {
+		return "", newErr(internalErr, fmt.Errorf("could not get access token from cookie: %w", err))
 	}
 
 	return cookie.Value, nil
@@ -289,8 +326,18 @@ takes cookie.Value
 	SetAccessToken(w, accessToken)
 */
 func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshToken string, err error) {
+
+	blacklisted, err := a.IsTokenBlacklisted(refreshToken)
+	if err != nil {
+		return "", "", err
+	}
+
+	if blacklisted {
+		return "", "", newErr(clientErr, "provided token is blacklisted")
+	}
+
 	// Validate refresh token
-	claims, err := a.validateToken(refreshToken)
+	claims, err := a.ValidateToken(refreshToken)
 	if err != nil {
 		return "", "", err
 	}
@@ -343,7 +390,7 @@ func (a *auth) generateToken(userID int, expiry time.Duration) (string, error) {
 	return token.SignedString(a.jwtSecretKey)
 }
 
-func (a *auth) validateToken(tokenString string) (*Claims, error) {
+func (a *auth) ValidateToken(tokenString string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
 		return a.jwtSecretKey, nil
 	})
