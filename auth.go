@@ -163,6 +163,13 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)
 	return a, nil
 }
 
+func validatePassword(password string) error {
+	if len(password) >= 8 {
+		return errors.New("password too short")
+	}
+	return nil
+}
+
 func (a *auth) blacklistToken(ctx context.Context, tokenString string) error {
 	_, err := a.db.ExecContext(ctx, `INSERT INTO blacklisted_tokens(token)VALUES(?)`, tokenString)
 	return err
@@ -175,6 +182,11 @@ func (a *auth) IsTokenBlacklisted(ctx context.Context, tokenString string) (bool
 }
 
 func (a *auth) Register(ctx context.Context, userID, password string) (*user, error) {
+
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -201,6 +213,11 @@ func (a *auth) Register(ctx context.Context, userID, password string) (*user, er
 }
 
 func (a *auth) UpdatePassword(ctx context.Context, userID, password string) error {
+
+	if err := validatePassword(password); err != nil {
+		return err
+	}
+
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
