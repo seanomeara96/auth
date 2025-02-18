@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -18,15 +19,15 @@ type Authenticator interface {
 	GetAccessTokenFromRequest(r *http.Request) (string, error)
 	GetRefreshTokenFromRequest(r *http.Request) (string, error)
 	GetTokensFromRequest(r *http.Request) (accessToken string, refreshToken string, err error)
-	IsTokenBlacklisted(tokenString string) (bool, error)
-	Login(userID string, password string) (accessToken string, refreshToken string, err error)
-	Logout(refreshToken string) error
-	Refresh(refreshToken string) (newAccessToken string, newRefreshToken string, err error)
-	Register(userID string, password string) (*user, error)
+	IsTokenBlacklisted(ctx context.Context, tokenString string) (bool, error)
+	Login(ctx context.Context, userID string, password string) (accessToken string, refreshToken string, err error)
+	Logout(ctx context.Context, refreshToken string) error
+	Refresh(ctx context.Context, refreshToken string) (newAccessToken string, newRefreshToken string, err error)
+	Register(ctx context.Context, userID string, password string) (*user, error)
 	SetAccessToken(w http.ResponseWriter, accessToken string)
 	SetRefreshToken(w http.ResponseWriter, refreshToken string)
 	SetTokens(w http.ResponseWriter, accessToken string, refreshToken string)
-	UpdatePassword(userID string, password string) error
+	UpdatePassword(ctx context.Context, userID string, password string) error
 	ValidateToken(tokenString string) (*Claims, error)
 }
 
@@ -162,18 +163,18 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)
 	return a, nil
 }
 
-func (a *auth) blacklistToken(tokenString string) error {
-	_, err := a.db.Exec(`INSERT INTO blacklisted_tokens(token)VALUES(?)`, tokenString)
+func (a *auth) blacklistToken(ctx context.Context, tokenString string) error {
+	_, err := a.db.ExecContext(ctx, `INSERT INTO blacklisted_tokens(token)VALUES(?)`, tokenString)
 	return err
 }
 
-func (a *auth) IsTokenBlacklisted(tokenString string) (bool, error) {
+func (a *auth) IsTokenBlacklisted(ctx context.Context, tokenString string) (bool, error) {
 	var exists bool = false
-	err := a.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM blacklisted_tokens WHERE token = ?)`, tokenString).Scan(&exists)
+	err := a.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM blacklisted_tokens WHERE token = ?)`, tokenString).Scan(&exists)
 	return exists, err
 }
 
-func (a *auth) Register(userID, password string) (*user, error) {
+func (a *auth) Register(ctx context.Context, userID, password string) (*user, error) {
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -181,7 +182,7 @@ func (a *auth) Register(userID, password string) (*user, error) {
 	}
 
 	// Save user to database
-	res, err := a.db.Exec("INSERT INTO users (user_id, password) VALUES (?, ?)", userID, string(hashedPassword))
+	res, err := a.db.ExecContext(ctx, "INSERT INTO users (user_id, password) VALUES (?, ?)", userID, string(hashedPassword))
 	if err != nil {
 		return nil, newErr(internalErr, fmt.Errorf("DB error orUser already exists %w", err))
 	}
@@ -199,7 +200,7 @@ func (a *auth) Register(userID, password string) (*user, error) {
 	return &user, nil
 }
 
-func (a *auth) UpdatePassword(userID, password string) error {
+func (a *auth) UpdatePassword(ctx context.Context, userID, password string) error {
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -207,7 +208,7 @@ func (a *auth) UpdatePassword(userID, password string) error {
 	}
 
 	// Save user to database
-	res, err := a.db.Exec("UPDATE users SET password = ? WHERE user_id = ?", string(hashedPassword), userID)
+	res, err := a.db.ExecContext(ctx, "UPDATE users SET password = ? WHERE user_id = ?", string(hashedPassword), userID)
 	if err != nil {
 		return newErr(internalErr, fmt.Errorf("DB failed to update password %w", err))
 	}
@@ -224,18 +225,18 @@ func (a *auth) UpdatePassword(userID, password string) error {
 	return nil
 }
 
-func (a *auth) getUserDetails(userID string) (*user, error) {
+func (a *auth) getUserDetails(ctx context.Context, userID string) (*user, error) {
 	var storedUser user
-	err := a.db.QueryRow("SELECT id, user_id, password FROM users WHERE user_id = ?", userID).Scan(&storedUser.UserID, &storedUser.UserID, &storedUser.Password)
+	err := a.db.QueryRowContext(ctx, "SELECT id, user_id, password FROM users WHERE user_id = ?", userID).Scan(&storedUser.UserID, &storedUser.UserID, &storedUser.Password)
 	if err != nil {
 		return nil, err
 	}
 	return &storedUser, nil
 }
 
-func (a *auth) Login(userID, password string) (accessToken string, refreshToken string, err error) {
+func (a *auth) Login(ctx context.Context, userID, password string) (accessToken string, refreshToken string, err error) {
 	// Fetch user from database
-	storedUser, err := a.getUserDetails(userID)
+	storedUser, err := a.getUserDetails(ctx, userID)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("error fetching stored user from db %w", err))
 	}
@@ -246,39 +247,39 @@ func (a *auth) Login(userID, password string) (accessToken string, refreshToken 
 	}
 
 	// Generate JWT tokens
-	accessToken, err = a.generateToken(storedUser.id, a.accessTokenDuration)
+	accessToken, err = a.generateToken(ctx, storedUser.id, a.accessTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to create access token %w", err))
 	}
 
-	refreshToken, err = a.generateToken(storedUser.id, a.refreshTokenDuration)
+	refreshToken, err = a.generateToken(ctx, storedUser.id, a.refreshTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to create refresh token %w", err))
 	}
 
-	if err := a.saveRefreshToken(storedUser.id, refreshToken); err != nil {
+	if err := a.saveRefreshToken(ctx, storedUser.id, refreshToken); err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to save refresh token during login"))
 	}
 
 	return accessToken, refreshToken, nil
 }
 
-func (a *auth) Logout(refreshToken string) error {
+func (a *auth) Logout(ctx context.Context, refreshToken string) error {
 
-	if _, err := a.db.Exec(`DELETE FROM refresh_tokens WHERE token = ?`, refreshToken); err != nil {
+	if _, err := a.db.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE token = ?`, refreshToken); err != nil {
 		return newErr(internalErr, fmt.Errorf(`failed to delete from refresh tokens at logout: %w`, err))
 	}
 
-	if err := a.blacklistToken(refreshToken); err != nil {
+	if err := a.blacklistToken(ctx, refreshToken); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (a *auth) saveRefreshToken(userID int, refreshToken string) error {
+func (a *auth) saveRefreshToken(ctx context.Context, userID int, refreshToken string) error {
 	// Save refresh token to database
-	_, err := a.db.Exec("INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
+	_, err := a.db.ExecContext(ctx, "INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
 		userID, refreshToken, time.Now().Add(a.refreshTokenDuration))
 	if err != nil {
 		return newErr(internalErr, fmt.Errorf("failed to save refresh token %w", err))
@@ -367,9 +368,9 @@ takes cookie.Value
 
 	SetAccessToken(w, accessToken)
 */
-func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshToken string, err error) {
+func (a *auth) Refresh(ctx context.Context, refreshToken string) (newAccessToken string, newRefreshToken string, err error) {
 
-	blacklisted, err := a.IsTokenBlacklisted(refreshToken)
+	blacklisted, err := a.IsTokenBlacklisted(ctx, refreshToken)
 	if err != nil {
 		return "", "", err
 	}
@@ -386,7 +387,7 @@ func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshTo
 
 	// Check if refresh token exists in database
 	var exists bool
-	err = a.db.QueryRow(
+	err = a.db.QueryRowContext(ctx,
 		"SELECT EXISTS (SELECT 1 FROM refresh_tokens WHERE user_id = ? AND token = ?)",
 		claims.UserID, refreshToken,
 	).Scan(&exists)
@@ -398,17 +399,17 @@ func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshTo
 	}
 
 	// Generate new access token
-	newAccessToken, err = a.generateToken(claims.UserID, a.accessTokenDuration)
+	newAccessToken, err = a.generateToken(ctx, claims.UserID, a.accessTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to generate access token in refresh function %w", err))
 	}
 
-	newRefreshToken, err = a.generateToken(claims.UserID, a.refreshTokenDuration)
+	newRefreshToken, err = a.generateToken(ctx, claims.UserID, a.refreshTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to generate refresh token in refresh function %w", err))
 	}
 
-	if err := a.saveRefreshToken(claims.UserID, newRefreshToken); err != nil {
+	if err := a.saveRefreshToken(ctx, claims.UserID, newRefreshToken); err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to save new refresh token during refresh: %w", err))
 	}
 
@@ -416,7 +417,7 @@ func (a *auth) Refresh(refreshToken string) (newAccessToken string, newRefreshTo
 
 }
 
-func (a *auth) generateToken(userID int, expiry time.Duration) (string, error) {
+func (a *auth) generateToken(ctx context.Context, userID int, expiry time.Duration) (string, error) {
 	// Generate a random UUID
 	randomID := uuid.New().String()
 
