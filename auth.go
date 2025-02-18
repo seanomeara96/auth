@@ -13,6 +13,23 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+type Authenticator interface {
+	Close() error
+	GetAccessTokenFromRequest(r *http.Request) (string, error)
+	GetRefreshTokenFromRequest(r *http.Request) (string, error)
+	GetTokensFromRequest(r *http.Request) (accessToken string, refreshToken string, err error)
+	IsTokenBlacklisted(tokenString string) (bool, error)
+	Login(userID string, password string) (accessToken string, refreshToken string, err error)
+	Logout(refreshToken string) error
+	Refresh(refreshToken string) (newAccessToken string, newRefreshToken string, err error)
+	Register(userID string, password string) (*user, error)
+	SetAccessToken(w http.ResponseWriter, accessToken string)
+	SetRefreshToken(w http.ResponseWriter, refreshToken string)
+	SetTokens(w http.ResponseWriter, accessToken string, refreshToken string)
+	UpdatePassword(userID string, password string) error
+	ValidateToken(tokenString string) (*Claims, error)
+}
+
 type authErrorType string
 
 const internalErr authErrorType = authErrorType("internal")
@@ -78,9 +95,9 @@ func (a *auth) Close() error {
 	return nil
 }
 
-func Init(config AuthConfig) (*auth, error) {
+func Init(config AuthConfig) (Authenticator, error) {
 
-	a := auth{}
+	a := &auth{}
 
 	if config.DatabaseSourceName == "" {
 		config.DatabaseSourceName = "./auth.db"
@@ -139,10 +156,10 @@ CREATE TABLE IF NOT EXISTS blacklisted_tokens(
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
 `)
 	if err != nil {
-		return &a, newErr(internalErr, fmt.Errorf("an error occured when trying to initalise the tables: %w", err))
+		return a, newErr(internalErr, fmt.Errorf("an error occured when trying to initalise the tables: %w", err))
 	}
 
-	return &a, nil
+	return a, nil
 }
 
 func (a *auth) blacklistToken(tokenString string) error {
