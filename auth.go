@@ -160,7 +160,7 @@ func (a *auth) Register(userID, password string) (*user, error) {
 	// Hash password
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return nil, newErr(internalErr, fmt.Errorf("failed to hash password: %w", err))
+		return nil, newErr(internalErr, fmt.Errorf("failed to hash password during register: %w", err))
 	}
 
 	// Save user to database
@@ -180,6 +180,31 @@ func (a *auth) Register(userID, password string) (*user, error) {
 	user.Password = password
 
 	return &user, nil
+}
+
+func (a *auth) UpdatePassword(userID, password string) error {
+	// Hash password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return newErr(internalErr, fmt.Errorf("failed to hash password during register: %w", err))
+	}
+
+	// Save user to database
+	res, err := a.db.Exec("UPDATE users SET password = ? WHERE user_id = ?", string(hashedPassword), userID)
+	if err != nil {
+		return newErr(internalErr, fmt.Errorf("DB failed to update password %w", err))
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return newErr(internalErr, err)
+	}
+
+	if rowsAffected == 0 {
+		return newErr(clientErr, "no user password was updated. likely no matching user id")
+	}
+
+	return nil
 }
 
 func (a *auth) getUserDetails(userID string) (*user, error) {
