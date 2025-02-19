@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -34,6 +35,8 @@ func TestBasicFlow(t *testing.T) {
 		}
 	}
 
+	ctx := context.Background()
+
 	auth, err := Init(AuthConfig{
 		JWTSecretKey: "super_secret_test_key",
 	})
@@ -47,12 +50,12 @@ func TestBasicFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	u, err := auth.Register("user1", string(testPassword))
+	u, err := auth.Register(ctx, "user1", string(testPassword))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	accessToken, refreshToken, err := auth.Login(u.UserID, u.Password)
+	accessToken, refreshToken, err := auth.Login(ctx, u.UserID, u.Password)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +74,7 @@ func TestBasicFlow(t *testing.T) {
 		t.Errorf("refresh token: %s %v", refreshToken, err)
 	}
 
-	accessToken, refreshToken, err = auth.Refresh(refreshToken)
+	accessToken, refreshToken, err = auth.Refresh(ctx, refreshToken)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,12 +89,12 @@ func TestBasicFlow(t *testing.T) {
 		t.Errorf("refresh token: %s %v", refreshToken, err)
 	}
 
-	err = auth.Logout(refreshToken)
+	err = auth.Logout(ctx, refreshToken)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, _, err = auth.Refresh(refreshToken)
+	_, _, err = auth.Refresh(ctx, refreshToken)
 	if err == nil {
 		t.Fatal("this should have errored as the refresh token no longer exists since the user logged out")
 	}
@@ -119,6 +122,8 @@ func TestServerFlow(t *testing.T) {
 		}
 	}
 
+	ctx := context.Background()
+
 	auth, err := Init(AuthConfig{
 		JWTSecretKey: "super_secret_test_key",
 	})
@@ -132,13 +137,13 @@ func TestServerFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	u, err := auth.Register("user1", string(testPassword))
+	u, err := auth.Register(ctx, "user1", string(testPassword))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	loginHandler := func(w http.ResponseWriter, r *http.Request) {
-		aToken, rToken, err := auth.Login(u.UserID, u.Password)
+		aToken, rToken, err := auth.Login(ctx, u.UserID, u.Password)
 		if err != nil {
 			http.Error(w, "could not login", 500)
 			return
@@ -155,7 +160,7 @@ func TestServerFlow(t *testing.T) {
 
 		_, err = auth.ValidateToken(aToken)
 		if err != nil {
-			aToken, rToken, err = auth.Refresh(rToken)
+			aToken, rToken, err = auth.Refresh(ctx, rToken)
 			if err != nil {
 				http.Error(w, "could not validate or refresh token", 500)
 				return
