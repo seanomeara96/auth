@@ -264,12 +264,12 @@ func (a *auth) Login(ctx context.Context, userID, password string) (accessToken 
 	}
 
 	// Generate JWT tokens
-	accessToken, err = a.generateToken(ctx, storedUser.id, a.accessTokenDuration)
+	accessToken, err = a.generateToken(storedUser.id, a.accessTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to create access token %w", err))
 	}
 
-	refreshToken, err = a.generateToken(ctx, storedUser.id, a.refreshTokenDuration)
+	refreshToken, err = a.generateToken(storedUser.id, a.refreshTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to create refresh token %w", err))
 	}
@@ -416,12 +416,12 @@ func (a *auth) Refresh(ctx context.Context, refreshToken string) (newAccessToken
 	}
 
 	// Generate new access token
-	newAccessToken, err = a.generateToken(ctx, claims.UserID, a.accessTokenDuration)
+	newAccessToken, err = a.generateToken(claims.UserID, a.accessTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to generate access token in refresh function %w", err))
 	}
 
-	newRefreshToken, err = a.generateToken(ctx, claims.UserID, a.refreshTokenDuration)
+	newRefreshToken, err = a.generateToken(claims.UserID, a.refreshTokenDuration)
 	if err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to generate refresh token in refresh function %w", err))
 	}
@@ -434,7 +434,7 @@ func (a *auth) Refresh(ctx context.Context, refreshToken string) (newAccessToken
 
 }
 
-func (a *auth) generateToken(ctx context.Context, userID int, expiry time.Duration) (string, error) {
+func (a *auth) generateToken(userID int, expiry time.Duration) (string, error) {
 	// Generate a random UUID
 	randomID := uuid.New().String()
 
