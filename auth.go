@@ -164,7 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id)
 }
 
 func validatePassword(password string) error {
-	if len(password) <= 8 {
+	if len(password) < 8 {
 		return errors.New("password too short")
 	}
 	return nil
