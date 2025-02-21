@@ -244,7 +244,7 @@ func (a *auth) UpdatePassword(ctx context.Context, userID, password string) erro
 
 func (a *auth) getUserDetails(ctx context.Context, userID string) (*user, error) {
 	var storedUser user
-	err := a.db.QueryRowContext(ctx, "SELECT id, user_id, password FROM users WHERE user_id = ?", userID).Scan(&storedUser.UserID, &storedUser.UserID, &storedUser.Password)
+	err := a.db.QueryRowContext(ctx, "SELECT id, user_id, password FROM users WHERE user_id = ?", userID).Scan(&storedUser.id, &storedUser.UserID, &storedUser.Password)
 	if err != nil {
 		return nil, err
 	}
@@ -428,6 +428,11 @@ func (a *auth) Refresh(ctx context.Context, refreshToken string) (newAccessToken
 
 	if err := a.saveRefreshToken(ctx, claims.UserID, newRefreshToken); err != nil {
 		return "", "", newErr(internalErr, fmt.Errorf("failed to save new refresh token during refresh: %w", err))
+	}
+
+	_, err = a.db.ExecContext(ctx, "DELETE FROM refresh_tokens WHERE token = ?", refreshToken)
+	if err != nil {
+		return "", "", newErr(internalErr, fmt.Errorf("failed to delete old refresh token %w", err))
 	}
 
 	return newAccessToken, newRefreshToken, nil
