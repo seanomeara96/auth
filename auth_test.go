@@ -122,8 +122,6 @@ func TestServerFlow(t *testing.T) {
 		}
 	}
 
-	ctx := context.Background()
-
 	auth, err := Init(AuthConfig{
 		JWTSecretKey: "super_secret_test_key",
 	})
@@ -137,13 +135,13 @@ func TestServerFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	u, err := auth.Register(ctx, "user1", string(testPassword))
+	u, err := auth.Register(context.Background(), "user1", string(testPassword))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	loginHandler := func(w http.ResponseWriter, r *http.Request) {
-		aToken, rToken, err := auth.Login(ctx, u.UserID, u.Password)
+		aToken, rToken, err := auth.Login(r.Context(), u.UserID, u.Password)
 		if err != nil {
 			http.Error(w, "could not login", 500)
 			return
@@ -151,54 +149,117 @@ func TestServerFlow(t *testing.T) {
 		auth.SetTokens(w, aToken, rToken)
 	}
 
-	middleHandler := func(w http.ResponseWriter, r *http.Request) {
-		aToken, rToken, err := auth.GetTokensFromRequest(r)
-		if err != nil {
-			http.Error(w, "could not get tokens from request", 500)
-			return
-		}
+	middleware := func(next func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
 
-		_, err = auth.ValidateToken(aToken)
-		if err != nil {
-			aToken, rToken, err = auth.Refresh(ctx, rToken)
+			aToken, rToken, err := auth.GetTokensFromRequest(r)
 			if err != nil {
-				http.Error(w, "could not validate or refresh token", 500)
+				http.Error(w, "could not get tokens from request", 500)
 				return
 			}
-			auth.SetTokens(w, aToken, rToken)
+
+			_, err = auth.ValidateToken(aToken)
+			if err != nil {
+				aToken, rToken, err = auth.Refresh(r.Context(), rToken)
+				if err != nil {
+					http.Error(w, "could not validate or refresh token", 500)
+					return
+				}
+				auth.SetTokens(w, aToken, rToken)
+			}
+
+			next(w, r)
 		}
-
-		//do some stuff
-
 	}
 
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/login", nil)
+	logoutHandler := func(w http.ResponseWriter, r *http.Request) {
+		_, refreshToken, err := auth.GetTokensFromRequest(r)
+		if err != nil {
+			http.Error(w, "failed to get tokens from request", 500)
+			return
+		}
+		if err := auth.Logout(r.Context(), refreshToken); err != nil {
+			http.Error(w, "failed to log out", 500)
+			return
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /login", loginHandler)
-	mux.HandleFunc("GET /middle", middleHandler)
-	mux.ServeHTTP(rr, req)
+	mux.HandleFunc("GET /home", middleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	mux.HandleFunc("GET /logout", middleware(logoutHandler))
 
-	if rr.Code != http.StatusOK {
-		t.Errorf("expected status %d, got %d", http.StatusOK, rr.Code)
+	loginRecorder := httptest.NewRecorder()
+	loginRequest := httptest.NewRequest("POST", "/login", nil)
+	mux.ServeHTTP(loginRecorder, loginRequest)
+	if loginRecorder.Code != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, loginRecorder.Code)
 	}
 
 	// Check if refresh token cookie is set
-	cookies := rr.Result().Cookies()
-	var refreshTokenSet bool
-	var accessTokenSet bool
+	cookies := loginRecorder.Result().Cookies()
+	var accessCookie, refreshCookie *http.Cookie
 	for _, cookie := range cookies {
 		if cookie.Name == "refresh_token" {
-			refreshTokenSet = true
+			refreshCookie = cookie
 		}
 		if cookie.Name == "access_token" {
-			accessTokenSet = true
+			accessCookie = cookie
 		}
 	}
-	if !refreshTokenSet {
+	if refreshCookie == nil {
 		t.Errorf("expected refresh token cookie to be set")
 	}
-	if !accessTokenSet {
+	if accessCookie == nil {
+		t.Errorf("expected access token cookie to be set")
+	}
+
+	homeRequest := httptest.NewRequest("GET", "/home", nil)
+	homeRequest.AddCookie(accessCookie)
+	homeRequest.AddCookie(refreshCookie)
+	homeRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(homeRecorder, homeRequest)
+	if homeRecorder.Code != http.StatusOK {
+		// apparently cant get tokens from request
+		t.Errorf("expected status %d, got %d", http.StatusOK, homeRecorder.Code)
+	}
+	for _, cookie := range cookies {
+		if cookie.Name == "refresh_token" {
+			refreshCookie = cookie
+		}
+		if cookie.Name == "access_token" {
+			accessCookie = cookie
+		}
+	}
+	if refreshCookie == nil {
+		t.Errorf("expected refresh token cookie to be set")
+	}
+	if accessCookie == nil {
+		t.Errorf("expected access token cookie to be set")
+	}
+
+	logoutRequest := httptest.NewRequest("GET", "/logout", nil)
+	logoutRequest.AddCookie(accessCookie)
+	logoutRequest.AddCookie(refreshCookie)
+	logoutRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(logoutRecorder, logoutRequest)
+	if logoutRecorder.Code != http.StatusOK {
+		t.Errorf("expected status %d, got %d", http.StatusOK, logoutRecorder.Code)
+	}
+	for _, cookie := range cookies {
+		if cookie.Name == "refresh_token" {
+			refreshCookie = cookie
+		}
+		if cookie.Name == "access_token" {
+			accessCookie = cookie
+		}
+	}
+	if refreshCookie == nil {
+		t.Errorf("expected refresh token cookie to be set")
+	}
+	if accessCookie == nil {
 		t.Errorf("expected access token cookie to be set")
 	}
 }
