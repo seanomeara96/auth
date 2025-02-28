@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -68,6 +70,12 @@ type auth struct {
 	jwtSecretKey         []byte
 	accessTokenDuration  time.Duration
 	refreshTokenDuration time.Duration
+	cookieSecure         bool
+	httpOnly             bool
+	sameSite             http.SameSite
+	cleanupTicker        *time.Ticker
+	tickerStopChannel    chan struct{}
+	wg                   sync.WaitGroup
 }
 
 type AuthConfig struct {
@@ -76,6 +84,9 @@ type AuthConfig struct {
 	AccessTokenDuration  time.Duration
 	RefreshTokenDuration time.Duration
 	DatabaseSourceName   string
+	CookieSecure         bool
+	HttpOnly             bool
+	SameSite             http.SameSite
 }
 
 type user struct {
@@ -89,7 +100,16 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
+/*
+If Close() is called while a cleanup is running, db.Close() could execute before the cleanup finishes,
+potentially causing a "database is closed" error or panic.
+SQLite’s locking might prevent this, but it’s not guaranteed with other databases.
+*/
 func (a *auth) Close() error {
+	if a.tickerStopChannel != nil {
+		close(a.tickerStopChannel)
+		a.wg.Wait()
+	}
 	if a.db != nil {
 		return a.db.Close()
 	}
@@ -154,11 +174,40 @@ CREATE TABLE IF NOT EXISTS blacklisted_tokens(
 	token TEXT NOT NULL UNIQUE,
 	blacklisted_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS login_attempts(
+	user_id INTEGER NOT NULL,
+	attempt_count INTEGER DEFAULT 0,
+	last_attempt DATETIME DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY (user_id) REFERENCES users(id)
+);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
 `)
 	if err != nil {
 		return a, newErr(internalErr, fmt.Errorf("an error occured when trying to initalise the tables: %w", err))
 	}
+
+	a.cleanupTicker = time.NewTicker(time.Hour)
+	a.tickerStopChannel = make(chan struct{})
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.cleanupExpiredTokens(context.Background())
+		for {
+			select {
+			case <-a.cleanupTicker.C:
+				func() {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+					defer cancel()
+					if err := a.cleanupExpiredTokens(ctx); err != nil {
+						log.Printf("Cleanup failed: %v", err) // Replace with your logger
+					}
+				}()
+			case <-a.tickerStopChannel:
+				a.cleanupTicker.Stop()
+				return
+			}
+		}
+	}()
 
 	return a, nil
 }
@@ -258,8 +307,23 @@ func (a *auth) Login(ctx context.Context, userID, password string) (accessToken 
 		return "", "", newErr(internalErr, fmt.Errorf("error fetching stored user from db %w", err))
 	}
 
+	var attemptCount int
+	var lastAttempt time.Time
+	err = a.db.QueryRowContext(ctx, `SELECT attempt_count, last_attempt FROM login_attempts WHERE user_id = ?`, storedUser.id).Scan(&attemptCount, &lastAttempt)
+	if err != nil && err != sql.ErrNoRows {
+		return "", "", newErr(internalErr, fmt.Errorf("failed to get attempt count from db %w", err))
+	}
+
+	if attemptCount > 5 && time.Since(lastAttempt) > 15*time.Minute {
+		return "", "", newErr(clientErr, "too many login attempts; try again later")
+	}
+
 	// Check password
 	if err := bcrypt.CompareHashAndPassword([]byte(storedUser.Password), []byte(password)); err != nil {
+		_, err = a.db.ExecContext(ctx,
+			"INSERT OR REPLACE INTO login_attempts (user_id, attempt_count, last_attempt) VALUES (?, ?, ?)",
+			storedUser.id, attemptCount+1, time.Now(),
+		)
 		return "", "", newErr(clientErr, fmt.Errorf("invalid credentials %w", err))
 	}
 
@@ -311,9 +375,9 @@ func (a *auth) SetAccessToken(w http.ResponseWriter, accessToken string) {
 		Value:    accessToken,
 		Path:     "/",
 		Expires:  time.Now().Add(a.accessTokenDuration),
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
+		HttpOnly: a.httpOnly,
+		Secure:   a.cookieSecure,
+		SameSite: a.sameSite,
 	})
 }
 
@@ -323,9 +387,9 @@ func (a *auth) SetRefreshToken(w http.ResponseWriter, refreshToken string) {
 		Value:    refreshToken,
 		Path:     "/",
 		Expires:  time.Now().Add(a.refreshTokenDuration),
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
+		HttpOnly: a.httpOnly,
+		Secure:   a.cookieSecure,
+		SameSite: a.sameSite,
 	})
 }
 
@@ -435,6 +499,10 @@ func (a *auth) Refresh(ctx context.Context, refreshToken string) (newAccessToken
 		return "", "", newErr(internalErr, fmt.Errorf("failed to delete old refresh token %w", err))
 	}
 
+	if err := a.blacklistToken(ctx, refreshToken); err != nil {
+		return "", "", newErr(internalErr, "failed to blacklist refresh token during refresh")
+	}
+
 	return newAccessToken, newRefreshToken, nil
 
 }
@@ -468,4 +536,32 @@ func (a *auth) ValidateToken(tokenString string) (*Claims, error) {
 	}
 
 	return nil, newErr(clientErr, `invalid access token cannot be validated`)
+}
+
+func (a *auth) cleanupExpiredTokens(ctx context.Context) error {
+	tx, err := a.db.Begin()
+	if err != nil {
+		return newErr(internalErr, fmt.Errorf("could not create tx: %w", err))
+	}
+
+	_, err = tx.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE expires_at < ?`, time.Now())
+	if err != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			return newErr(internalErr, fmt.Errorf("failed to delete refresh tokens: %w; rollback failed: %v", err, rollbackErr))
+		}
+		return newErr(internalErr, fmt.Errorf("failed to delete refresh tokens: %w", err))
+	}
+
+	_, err = tx.ExecContext(ctx, `DELETE FROM blacklisted_tokens WHERE blacklisted_at < ?`, time.Now().Add(-24*7*time.Hour))
+	if err != nil {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			return newErr(internalErr, fmt.Errorf("failed to delete blacklisted tokens: %w; rollback failed: %v", err, rollbackErr))
+		}
+		return newErr(internalErr, fmt.Errorf("failed to delete blacklisted tokens: %w", err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return newErr(internalErr, fmt.Errorf("failed to commit cleanup transaction: %w", err))
+	}
+	return nil
 }
