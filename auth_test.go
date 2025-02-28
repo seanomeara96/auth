@@ -225,6 +225,7 @@ func TestServerFlow(t *testing.T) {
 		// apparently cant get tokens from request
 		t.Errorf("expected status %d, got %d", http.StatusOK, homeRecorder.Code)
 	}
+	cookies = homeRecorder.Result().Cookies()
 	for _, cookie := range cookies {
 		if cookie.Name == "refresh_token" {
 			refreshCookie = cookie
@@ -248,6 +249,7 @@ func TestServerFlow(t *testing.T) {
 	if logoutRecorder.Code != http.StatusOK {
 		t.Errorf("expected status %d, got %d", http.StatusOK, logoutRecorder.Code)
 	}
+	cookies = logoutRecorder.Result().Cookies()
 	for _, cookie := range cookies {
 		if cookie.Name == "refresh_token" {
 			refreshCookie = cookie
