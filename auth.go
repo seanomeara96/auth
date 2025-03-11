@@ -116,7 +116,7 @@ func (a *auth) Close() error {
 	return nil
 }
 
-func Init(config AuthConfig) (Authenticator, error) {
+func Init(config AuthConfig) (*auth, error) {
 
 	a := &auth{}
 
